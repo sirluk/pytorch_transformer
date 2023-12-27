@@ -1,0 +1,23 @@
+model_cfg:
+  context_length: 512
+  model_dim: 512
+  n_blocks: 4
+  n_attn_heads: 4
+  ffn_hidden_dim: 1024
+  dropout: 0.1
+  bias: False
+train_cfg:
+  lr: 1e-4
+  lr_min: 1e-5
+  batch_size: 16
+  adam_b1: 0.9
+  adam_b2: 0.95
+  adam_eps: 10e-6
+  adam_weight_decay: 0.1
+  gradient_accumulation_steps: 2
+  max_grad: 1.0
+  train_iters: 6e5
+  warmup_iters: 2000
+  eval_interval: 2000
+  eval_iters: null
+  

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import yaml
 import argparse
 import os
@@ -11,7 +13,6 @@ from itertools import chain, cycle
 from functools import partial
 from datasets import load_dataset, load_from_disk, DatasetDict, Dataset
 from torch.utils.data import IterableDataset, DataLoader
-from concurrent.futures import ProcessPoolExecutor
 
 from typing import Union, Optional
 

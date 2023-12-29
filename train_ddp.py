@@ -1,16 +1,22 @@
+import os
 import argparse
 import math
-import torch
 import numpy as np
 from functools import partial
 from tqdm import trange
-from torch import nn
-from torch.nn import functional as F
-from model import Transformer
-from data_loader import TokenizedDataset
-from torch.utils.data import DataLoader
 from ruamel.yaml import YAML
 from contextlib import nullcontext
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing as mp
+from torch.distributed import init_process_group, destroy_process_group
+from torch.utils.data import DataLoader
+
+from model import Transformer
+from data_loader import TokenizedDataset
 
 
 def cosine_decay_schedule(epoch, total_epochs, warmup_epochs, lr_max, lr_min):
@@ -29,23 +35,62 @@ def cycle(iterable):
         for x in iterable:
             yield x
 
+
+def run(main_func, backend, num_machines, num_gpus, machine_rank, dist_url, args=()):
+    world_size = num_machines * num_gpus
+
+    mp.spawn(
+        distributed_worker,
+        nprocs=num_gpus,
+        args=(
+            main_func,
+            backend,
+            world_size,
+            num_gpus,
+            machine_rank,
+            dist_url,
+            args,
+        ),
+        daemon=False,
+    )
+
 # TO SET
-DEVICE = 'cuda:0'
+DEVICE = 'cuda'
 DTYPE = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+DDP_BACKEND = 'nccl' # 'nccl', 'gloo', etc.
 
+with open("cfg.yml", "r") as f:
+    cfg = YAML().load(f)
+model_cfg = argparse.Namespace(**cfg['model_cfg'])
+train_cfg = argparse.Namespace(**cfg['train_cfg'])
 
-device_type = 'cuda' if 'cuda' in DEVICE else 'cpu' # for later use in torch.autocast
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    init_process_group(backend=DDP_BACKEND)
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+    seed_offset = ddp_rank # each process gets a different seed
+    # world_size number of processes will be training simultaneously, so we can scale
+    # down the desired gradient accumulation iterations per process proportionally
+    assert train_cfg.gradient_accumulation_steps % ddp_world_size == 0
+    train_cfg.gradient_accumulation_steps //= ddp_world_size
+else:
+    # if not ddp, we are running on a single gpu, and one process
+    master_process = True
+    seed_offset = 0
+    ddp_world_size = 1
+
+device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[DTYPE]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 scaler = torch.cuda.amp.GradScaler(enabled=(DTYPE == 'float16'))
 
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-
-with open("cfg.yml", "r") as f:
-    cfg = YAML().load(f)
-model_cfg = argparse.Namespace(**cfg['model_cfg'])
-train_cfg = argparse.Namespace(**cfg['train_cfg'])
 
 setattr(model_cfg, 'vocab_size', TokenizedDataset.TOKENIZER.n_words)
 
@@ -60,7 +105,13 @@ model = Transformer(model_cfg)
 
 model = torch.compile(model)
 
-model.to(DEVICE)
+# wrap model into DDP container
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module
+else:
+    model.to(DEVICE)
+    raw_model = model
 
 optimizer = torch.optim.AdamW(
     model.parameters(),
@@ -93,6 +144,12 @@ for step in train_iterator:
 
     train_loss = 0
     for sub_step in range(train_cfg.gradient_accumulation_steps):
+        if ddp:
+            # in DDP training we only need to sync gradients at the last micro step.
+            # the official way to do this is with model.no_sync() context manager, but
+            # I really dislike that this bloats the code and forces us to repeat code
+            # looking at the source of that context manager, it just toggles this variable
+            model.require_backward_grad_sync = (sub_step == train_cfg.gradient_accumulation_steps - 1)    
         with ctx:
             logits = model(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
@@ -136,7 +193,8 @@ for step in train_iterator:
 
     train_iterator.set_description(train_str.format(step, train_loss, eval_loss), refresh=True)
 
-
+if ddp:
+    destroy_process_group()
 
 
 

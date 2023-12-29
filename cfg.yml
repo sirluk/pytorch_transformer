@@ -1,14 +1,24 @@
 model_cfg:
-  context_length: 512
+  context_length: 256
   model_dim: 512
-  n_blocks: 4
-  n_attn_heads: 4
-  ffn_hidden_dim: 1024
-  dropout: 0.1
+  n_blocks: 2
+  n_attn_heads: 2
+  ffn_hidden_dim: null
+  dropout_prob: 0.1
   bias: False
+  norm_eps: 1e-5
+model_cfg_llama7b:
+  context_length: 2048
+  model_dim: 4096
+  n_blocks: 32
+  n_attn_heads: 32
+  ffn_hidden_dim: null # model_dim * 4
+  dropout_prob: 0.1
+  bias: False
+  norm_eps: 1e-5
 train_cfg:
-  lr: 1e-4
-  lr_min: 1e-5
+  lr: 3e-4
+  lr_min: 3e-5
   batch_size: 16
   adam_b1: 0.9
   adam_b2: 0.95
@@ -19,5 +29,5 @@ train_cfg:
   train_iters: 6e5
   warmup_iters: 2000
   eval_interval: 2000
-  eval_iters: null
+  eval_iters: 200
   

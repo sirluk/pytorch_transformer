@@ -1,21 +1,25 @@
 model_cfg:
-  context_length: 256
+  context_length: 512
   model_dim: 512
-  n_blocks: 2
-  n_attn_heads: 2
+  n_blocks: 8
+  n_attn_heads: 8
   ffn_hidden_dim: null
-  dropout_prob: 0.1
+  dropout_prob: 0.0
   bias: False
   norm_eps: 1e-5
+  tie_word_embeddings: True
+  ffn_hidden_dim_multiple_of: 256
 model_cfg_llama7b:
-  context_length: 2048
+  context_length: 4096
   model_dim: 4096
   n_blocks: 32
   n_attn_heads: 32
   ffn_hidden_dim: null # model_dim * 4
-  dropout_prob: 0.1
+  dropout_prob: 0.0
   bias: False
   norm_eps: 1e-5
+  tie_word_embeddings: False
+  ffn_hidden_dim_multiple_of: 256
 train_cfg:
   lr: 3e-4
   lr_min: 3e-5
@@ -30,4 +34,5 @@ train_cfg:
   warmup_iters: 2000
   eval_interval: 2000
   eval_iters: 200
+  track_memory: True
   

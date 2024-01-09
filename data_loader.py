@@ -55,12 +55,12 @@ class TokenizedDataset(IterableDataset):
                 ar_start_idx += len(shard_tokens)
     
 
-    def __init__(self, filenames: Union[str, list[str]], context_length: int):
+    def __init__(self, filepaths: Union[str, list[str]], context_length: int):
         super().__init__()
             
-        if isinstance(filenames, str):
-            filenames = [filenames]
-        self.filenames = sorted(filenames)
+        if isinstance(filepaths, str):
+            filepaths = [filepaths]
+        self.filepaths = sorted(filepaths)
 
         self.context_length = context_length
 
@@ -89,12 +89,12 @@ class TokenizedDataset(IterableDataset):
         # combine the worker_id and worker_rank to create a unique seed for rng
         seed = 42 + worker_id + 1337 * rank
         rng = random.Random(seed)
-        rng.shuffle(self.filenames)
-        return chain.from_iterable(map(partial(self._process_data, rng=rng), cycle(self.filenames)))
+        rng.shuffle(self.filepaths)
+        return chain.from_iterable(map(partial(self._process_data, rng=rng), cycle(self.filepaths)))
     
 
     def __len__(self):
-        return sum([len(np.memmap(f, mode='r')) for f in self.filenames])
+        return sum([len(np.memmap(f, mode='r')) for f in self.filepaths])
 
 
 
@@ -117,7 +117,7 @@ if __name__ == '__main__':
     if not os.path.exists('train.bin'):
         TokenizedDataset.preprocess_hf_dataset(_ds, num_proc=64, batch_size=1024, text_col='text')
     
-    ds = TokenizedDataset(filenames='train.bin', context_length=cfg.context_length)
+    ds = TokenizedDataset(filepaths='train.bin', context_length=cfg.context_length)
 
     dl = DataLoader(ds, batch_size=4)
 

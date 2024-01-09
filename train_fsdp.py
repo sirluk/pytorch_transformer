@@ -5,7 +5,8 @@ import math
 import numpy as np
 import wandb
 from ruamel.yaml import YAML
-from tqdm import trange
+from tqdm import trange, tqdm
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -13,28 +14,27 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    CPUOffload,
-    BackwardPrefetch,
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    FullStateDictConfig,
+    StateDictType,
+    FullOptimStateDictConfig
 )
-from torch.distributed.fsdp.wrap import (
-    size_based_auto_wrap_policy,
-    enable_wrap,
-    wrap,
-)
+from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload, BackwardPrefetch
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-from model import Transformer
+from model import Transformer, TransformerBlock
 from data_loader import TokenizedDataset
 
 
-def cosine_decay_schedule(epoch, total_epochs, warmup_epochs, lr_max, lr_min):
-    if epoch < warmup_epochs:
-        return epoch / warmup_epochs
+def cosine_decay_schedule(step, total_steps, warmup_steps, lr_max, lr_min):
+    if step < warmup_steps:
+        return step / warmup_steps
     else:
-        n = total_epochs - warmup_epochs - 1
-        epoch -= warmup_epochs
-        coeff = 0.5 * (1 + math.cos(epoch / n * math.pi))
+        n = total_steps - warmup_steps - 1
+        step -= warmup_steps
+        coeff = 0.5 * (1 + math.cos(step / n * math.pi))
         lr = lr_min + (lr_max - lr_min) * coeff
         return lr / lr_max
     
@@ -45,24 +45,18 @@ def cycle(iterable):
             yield x
 
 
-def func(global_rank, local_rank, train_cfg, model_cfg):
+def func(global_rank, local_rank, world_size, train_cfg, model_cfg):
 
     # if global_rank == 0: wandb.init(project="pytorch-transformer", config = train_cfg.__dict_)
 
+    torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[train_cfg.dtype]
     ctx = torch.amp.autocast(device_type='cuda', dtype=ptdtype)
-    scaler = torch.cuda.amp.GradScaler(enabled=(train_cfg.dtype == 'float16'))
+    scaler = torch.cuda.amp.GradScaler(enabled=(ptdtype == "float16"))
 
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-
-    # min_num_params (int): Customizable policy input that controls the size
-    # threshold over which a module is ready to be wrapped. This is in
-    # units of numel.
-    auto_wrap_policy = functools.partial(
-        size_based_auto_wrap_policy, min_num_params=int(1e5)
-    )
 
     ds_train = TokenizedDataset(filenames='data/train.bin', context_length=model_cfg.context_length)
     ds_val = TokenizedDataset(filenames='data/test.bin', context_length=model_cfg.context_length)
@@ -71,9 +65,25 @@ def func(global_rank, local_rank, train_cfg, model_cfg):
     dl_val = DataLoader(ds_val, batch_size=train_cfg.batch_size, pin_memory=True, pin_memory_device=device)
     dl_train = cycle(dl_train)
 
+    transformer_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={
+            TransformerBlock,
+        }
+    )
+    cpu_offload = CPUOffload(offload_params=False)
+    mixed_precision = MixedPrecision(param_dtype=ptdtype)
+
     model = Transformer(model_cfg)
     model.to(device)
-    model = FSDP(model, auto_wrap_policy=auto_wrap_policy)
+    model = FSDP(
+        model,
+        cpu_offload=cpu_offload,
+        auto_wrap_policy=transformer_wrap_policy,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        mixed_precision=mixed_precision,
+        device_id=torch.cuda.current_device()
+    )
     # model = torch.compile(model)
     model.train()
 
@@ -87,49 +97,66 @@ def func(global_rank, local_rank, train_cfg, model_cfg):
 
     lr_lambda = functools.partial(
         cosine_decay_schedule,
-        total_epochs=int(train_cfg.train_iters) // train_cfg.gradient_accumulation_steps,
-        warmup_epochs=int(train_cfg.warmup_iters) // train_cfg.gradient_accumulation_steps,
+        total_steps=int(train_cfg.train_iters) // train_cfg.gradient_accumulation_steps,
+        warmup_steps=int(train_cfg.warmup_iters) // train_cfg.gradient_accumulation_steps,
         lr_max=train_cfg.lr,
         lr_min=train_cfg.lr_min
     )
     lr_schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    train_str = "training - step {}, loss: {:7.5f}, last_eval_loss: {:7.5f}"
+    train_str = "training - step {}, loss: {:7.5f}, last_eval_loss: {:7.5f}, mem_allocated (gb): {}, mem_reserved (gb): {}"
     train_steps = int(train_cfg.train_iters) // train_cfg.gradient_accumulation_steps
-    train_iterator = trange(train_steps, leave=False, position=0, disable=(global_rank==0))
+    train_iterator = trange(train_steps, desc=train_str, leave=False, position=0, disable=(global_rank!=0))
+    bytes_to_gb = lambda x: round(x / 1e9, ndigits=4)
+    eval_loss = math.inf
+    best_eval_loss = math.inf
 
     for step in train_iterator:
 
         x, y = next(dl_train)
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-   
-        with ctx:
-            logits = model(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+
+        with model.no_sync(), ctx:
+            loss = 0.0
+            for _ in range(train_cfg.gradient_accumulation_steps):
+                logits = model(x)
+                partial_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+                loss += partial_loss / train_cfg.gradient_accumulation_steps
         scaler.scale(loss).backward()
 
-        dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-        train_loss = loss.item()
+        if world_size > 1:
+            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+            train_loss = loss.item() / world_size
+        else:
+            train_loss = loss.item()
 
         if train_cfg.max_grad is not None:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad)
+            model.clip_grad_norm_(train_cfg.max_grad)
 
         scaler.step(optimizer)
         scaler.update()
 
         optimizer.zero_grad(set_to_none=True)
-        
+
         lr_schedule.step()
 
         if step % train_cfg.eval_interval == 0:
 
             model.eval()
 
-            losses = np.array([])
+            eval_iters = train_cfg.eval_iters if train_cfg.eval_iters is not None else len(dl_val)
+            eval_str = "evaluating - step {}"
+            eval_iterator = tqdm(dl_val, desc=eval_str.format(0), total=eval_iters, leave=False, position=1, disable=(global_rank!=0))
+            losses = torch.tensor([], device=device)
 
-            for eval_step, (x, y) in enumerate(dl_val):
+            for eval_step, (x, y) in enumerate(eval_iterator):
+
+                eval_iterator.set_description(
+                    eval_str.format(eval_step),
+                    refresh=True
+                )
 
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
@@ -138,26 +165,49 @@ def func(global_rank, local_rank, train_cfg, model_cfg):
                     logits = model(x)
                     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
 
-                dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                losses = np.append(losses, loss.item())
+                losses = torch.cat([losses, loss.unsqueeze(0)])
 
-                if train_cfg.eval_iters is not None and eval_step + 1 >= train_cfg.eval_iters:
+                if eval_step + 1 == eval_iters:
                     break
 
-            eval_loss = losses.mean()
+            if world_size > 1:
+                dist.all_reduce(losses, op=dist.ReduceOp.SUM)
+
+            eval_loss = losses.mean() / world_size
 
             model.train()
 
-        # if global_rank == 0: wandb.log({"train_loss": train_loss, "eval_loss": eval_loss})
+            if eval_loss < best_eval_loss:
+                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                optim_save_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                with FSDP.state_dict_type(
+                    model, StateDictType.FULL_STATE_DICT,
+                    state_dict_config = save_policy,
+                    optim_state_dict_config = optim_save_policy
+                ):   
+                    save_dict = {
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "lr_schedule": lr_schedule.state_dict(),
+                        "step": step
+                    }
+                    if global_rank == 0:
+                        torch.save(save_dict, "best_model.pt")
+                best_eval_loss = eval_loss
 
-        train_iterator.set_description(train_str.format(step, train_loss, eval_loss), refresh=True)
+        log_dict = {
+            "train_loss": train_loss,
+            "eval_loss": eval_loss,
+            "memory_allocated": bytes_to_gb(torch.cuda.memory_allocated(device=device)),
+            "memory_reserved": bytes_to_gb(torch.cuda.memory_reserved(device=device))
+        }
+        
+        # if global_rank == 0: wandb.log(log_dict)
 
-        if False==True:
-            # use a barrier to make sure training is done on all ranks
-            dist.barrier()
-            states = model.state_dict()
-            if global_rank == 0:
-                torch.save(states, "model.pt")
+        train_iterator.set_description(
+            train_str.format(step, *log_dict.values()),
+            refresh=True
+        )
 
 
 def distributed_worker(
@@ -184,11 +234,11 @@ def distributed_worker(
         rank=global_rank
     )
 
-    torch.cuda.set_device(local_rank)
-
     print(f"starting process with global rank {global_rank}")
 
-    main_func(global_rank, local_rank, *main_func_args)
+    main_func(global_rank, local_rank, world_size, *main_func_args)
+
+    dist.barrier()
 
     dist.destroy_process_group()
     

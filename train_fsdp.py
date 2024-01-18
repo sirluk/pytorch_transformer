@@ -4,6 +4,7 @@ import functools
 import math
 import numpy as np
 import wandb
+from datetime import datetime
 from ruamel.yaml import YAML
 from tqdm import trange, tqdm
 from contextlib import nullcontext
@@ -25,6 +26,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload, Backw
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from model import Transformer, TransformerBlock
+from model_qq import TransformerQQ, TransformerBlock as TransformerBlockQQ
 from data_loader import TokenizedDataset
 
 
@@ -45,9 +47,23 @@ def cycle(iterable):
             yield x
 
 
-def func(global_rank, local_rank, world_size, train_cfg, model_cfg):
+def func(global_rank, local_rank, world_size, train_cfg, model_cfg, model_cls, model_block_cls):
 
-    # if global_rank == 0: wandb.init(project="pytorch-transformer", config = train_cfg.__dict_)
+    if global_rank == 0:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if model_cfg.k_config == 'qq' or model_cfg.v_config == 'qq':
+            qq_config = f'{model_cfg.controller_alpha}_{model_cfg.controller_k}_{model_cfg.controller_temperature}_'
+        else:
+            qq_config = ''
+        wandb.init(
+            project = "pytorch-transformer",
+            config = train_cfg.__dict__,
+            name = f"{model_cfg.context_length}_{model_cfg.model_dim}_{model_cfg.n_blocks}_{model_cfg.n_attn_heads}_k{model_cfg.k_config}_v{model_cfg.v_config}_{qq_config}ts_{ts}"
+        )
+        checkpoint_dir = os.path.join('/local00/bioinf/hauzenbe/checkpoints', wandb.run.dir.split("/")[-2])
+        if not os.path.exists(checkpoint_dir):
+            os.mkdir(checkpoint_dir)
+        print(wandb.run.dir)
 
     torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
@@ -58,8 +74,12 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg):
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 
-    ds_train = TokenizedDataset(filenames='data/train.bin', context_length=model_cfg.context_length)
-    ds_val = TokenizedDataset(filenames='data/test.bin', context_length=model_cfg.context_length)
+    # path = '/system/user/publicdata/slimpajama_sampled/pretokenized'
+    path = '/local00/bioinf/hauzenbe/slimpajama_sampled'
+    filepaths_train = [os.path.join(path, 'train', f) for f in os.listdir(os.path.join(path, 'train'))]
+    filepaths_val = [os.path.join(path, 'validation', f) for f in os.listdir(os.path.join(path, 'validation'))]
+    ds_train = TokenizedDataset(filepaths=filepaths_train, context_length=model_cfg.context_length)
+    ds_val = TokenizedDataset(filepaths=filepaths_val, context_length=model_cfg.context_length)
 
     dl_train = DataLoader(ds_train, batch_size=train_cfg.batch_size, pin_memory=True, pin_memory_device=device)
     dl_val = DataLoader(ds_val, batch_size=train_cfg.batch_size, pin_memory=True, pin_memory_device=device)
@@ -68,19 +88,19 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg):
     transformer_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
-            TransformerBlock,
+            model_block_cls,
         }
     )
-    cpu_offload = CPUOffload(offload_params=False)
+    cpu_offload = CPUOffload(offload_params=True)
     mixed_precision = MixedPrecision(param_dtype=ptdtype)
 
-    model = Transformer(model_cfg)
+    model = model_cls(model_cfg)
     model.to(device)
     model = FSDP(
         model,
         cpu_offload=cpu_offload,
         auto_wrap_policy=transformer_wrap_policy,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE, # BackwardPrefetch.BACKWARD_PRE or BackwardPrefetch.BACKWARD_POST
         mixed_precision=mixed_precision,
         device_id=torch.cuda.current_device()
     )
@@ -120,8 +140,10 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg):
         with model.no_sync(), ctx:
             loss = 0.0
             for _ in range(train_cfg.gradient_accumulation_steps):
-                logits = model(x)
-                partial_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+                out = model(x, y)
+                partial_loss = out['loss']
+                if 'aux_loss' in out:
+                    partial_loss += out['aux_loss']
                 loss += partial_loss / train_cfg.gradient_accumulation_steps
         scaler.scale(loss).backward()
 
@@ -149,31 +171,38 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg):
             eval_iters = train_cfg.eval_iters if train_cfg.eval_iters is not None else len(dl_val)
             eval_str = "evaluating - step {}"
             eval_iterator = tqdm(dl_val, desc=eval_str.format(0), total=eval_iters, leave=False, position=1, disable=(global_rank!=0))
-            losses = torch.tensor([], device=device)
 
-            for eval_step, (x, y) in enumerate(eval_iterator):
+            losses = torch.zeros((eval_iters,), device=device)
+            aux_losses = torch.zeros((eval_iters,), device=device)
 
-                eval_iterator.set_description(
-                    eval_str.format(eval_step),
-                    refresh=True
-                )
+            with torch.no_grad():
+                for eval_step, (x, y) in enumerate(eval_iterator):
 
-                x = x.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
+                    eval_iterator.set_description(
+                        eval_str.format(eval_step),
+                        refresh=True
+                    )
 
-                with torch.no_grad():
-                    logits = model(x)
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
 
-                losses = torch.cat([losses, loss.unsqueeze(0)])
+                    out = model(x, y)
 
-                if eval_step + 1 == eval_iters:
-                    break
+                    losses[eval_step] = out['loss']
+                    if 'aux_loss' in out:
+                        aux_losses[eval_step] = out['aux_loss']
+
+                    if eval_step + 1 == eval_iters:
+                        break
 
             if world_size > 1:
                 dist.all_reduce(losses, op=dist.ReduceOp.SUM)
+                if 'aux_loss' in out:
+                    dist.all_reduce(aux_losses, op=dist.ReduceOp.SUM)
 
-            eval_loss = losses.mean() / world_size
+            losses = losses / world_size
+            aux_losses = aux_losses / world_size
+            eval_loss = (losses + aux_losses).mean()
 
             model.train()
 
@@ -192,17 +221,18 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg):
                         "step": step
                     }
                     if global_rank == 0:
-                        torch.save(save_dict, "best_model.pt")
+                        torch.save(save_dict, os.path.join(checkpoint_dir, "best_model.pt"))
                 best_eval_loss = eval_loss
 
         log_dict = {
             "train_loss": train_loss,
-            "eval_loss": eval_loss,
+            "eval_loss": losses.mean(),
+            "eval_loss_aux": aux_losses.mean(),
             "memory_allocated": bytes_to_gb(torch.cuda.memory_allocated(device=device)),
             "memory_reserved": bytes_to_gb(torch.cuda.memory_reserved(device=device))
         }
         
-        # if global_rank == 0: wandb.log(log_dict)
+        if global_rank == 0: wandb.log(log_dict)
 
         train_iterator.set_description(
             train_str.format(step, *log_dict.values()),
@@ -247,6 +277,7 @@ def main():
     torch.set_num_threads(1)
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["NCCL_DEBUG"] = "INFO"
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
     print(f"CUDA {torch.version.cuda} - cuDNN {torch.backends.cudnn.version()} - cudaNCCL {torch.cuda.nccl.version()}")
     parser = argparse.ArgumentParser()
@@ -255,20 +286,25 @@ def main():
     parser.add_argument("--num-machines", type=int, default=1, help="# of machines.")
     parser.add_argument("--machine-rank", type=int, default=0, help="the rank of this machine (unique per machine).")
     parser.add_argument("--master-addr", type=str, default='127.0.0.1', help="the ip address of the main machine")
-    parser.add_argument("--master-port", type=int, default=1234, help="the port of the main machine")#")
+    parser.add_argument("--master-port", type=int, default=1234, help="the port of the main machine")
+    parser.add_argument("--model-cfg", type=str, default='model_cfg', help="name of the model config")
     args = parser.parse_args()
 
     with open("cfg.yml", "r") as f:
         cfg = YAML().load(f)
-    model_cfg = argparse.Namespace(**cfg['model_cfg'])
+    model_cfg = argparse.Namespace(**cfg[args.model_cfg])
     train_cfg = argparse.Namespace(**cfg['train_cfg'])
 
     # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
     setattr(train_cfg, 'dtype', 'bfloat16' if torch.cuda.is_bf16_supported() else 'float16')
     setattr(model_cfg, 'vocab_size', TokenizedDataset.TOKENIZER.n_words)
+    setattr(model_cfg, 'cfg_name', args.model_cfg)
     
     dist_url = f"tcp://{args.master_addr}:{args.master_port}"
     world_size = args.num_machines * args.num_gpus
+
+    model_cls = TransformerQQ if 'qq' in args.model_cfg else Transformer
+    model_block_cls = TransformerBlockQQ if 'qq' in args.model_cfg else TransformerBlock
 
     mp.spawn(
         distributed_worker,
@@ -279,7 +315,7 @@ def main():
             args.num_gpus,
             args.machine_rank,
             dist_url,
-            (train_cfg, model_cfg)
+            (train_cfg, model_cfg, model_cls, model_block_cls)
         ),
         nprocs=args.num_gpus,
         daemon=False

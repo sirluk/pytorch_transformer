@@ -68,7 +68,7 @@ class TokenizedDataset(IterableDataset):
     def _process_data(self, data, rng: Optional[random.Random] = None):
         if rng is None:
             rng = random.Random(0)
-        ar = np.memmap(data, mode='r')
+        ar = np.memmap(data, dtype=np.uint16, mode='r')
         n_chunks, max_offset = divmod(len(ar)-1, self.context_length)
         chunks = list(range(n_chunks))
         rng.shuffle(chunks)
@@ -94,7 +94,7 @@ class TokenizedDataset(IterableDataset):
     
 
     def __len__(self):
-        return sum([len(np.memmap(f, mode='r')) for f in self.filepaths])
+        return sum([len(np.memmap(f, dtype=np.uint16, mode='r')) for f in self.filepaths])
 
 
 

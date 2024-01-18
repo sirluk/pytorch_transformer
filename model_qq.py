@@ -28,11 +28,32 @@ class ControllerLayer(nn.Module):
         self.proj = nn.Linear(input_dim, output_dim, bias=False)
 
     def forward(self, x, return_loss=True, return_moe_metrics=False):
+        B, nh, C, D = x.shape
         logits = self.proj(x)
         if self.use_temperature:
             logits = logits / self.temperature
         probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_idx = torch.topk(probs, k=self.k, dim=-1)
+        head_likelihood = torch.exp(torch.log(probs.detach()).sum(dim=1))
+
+
+        n = 4
+        groups = torch.argsort(head_likelihood, dim=-1, descending=True)
+        mean_group_probs = torch.gather(probs, dim=-1, index=groups.unsqueeze(1).expand(-1, nh, -1, -1)).reshape(B, nh, C, -1, n).mean(dim=(1,3))
+        router_selections = torch.gather(
+            x.unsqueeze(-2).expand(-1,-1,-1,nh,-1),
+            dim=1,
+            index=groups.unsqueeze(1).unsqueeze(-1).expand(-1, nh, -1, -1, self.input_dim)
+        )
+
+        import IPython; IPython.embed(); exit(1)
+
+        groups.reshape(B, C, -1, n).reshape(-2,-1)
+
+        topk_probs, b = torch.topk(probs, k=self.k, dim=-1)
+        ranks = torch.argsort(probs, dim=-1, descending=True)
+        topk_ranks, _ = torch.topk(ranks[...,:self.k].transpose(1,2).contiguous().view(B, C, -1), k=self.k)
+
+        # topk_probs, topk_idx = torch.topk(probs, k=self.k, dim=-1)
         import IPython; IPython.embed(); exit(1)
         static_dims = (len(x.shape)) * [-1]
         router_selections = torch.gather(
@@ -467,9 +488,9 @@ if __name__ == '__main__':
 
     x = torch.randn((4, cfg.context_length, cfg.model_dim))
 
-    import IPython; IPython.embed(); exit(1)
+    # import IPython; IPython.embed(); exit(1)
 
-    # y = qq(x, freqs_cos, freqs_sin)
+    y = qq(x, freqs_cos, freqs_sin)
 
     # y.sum().backward()
 

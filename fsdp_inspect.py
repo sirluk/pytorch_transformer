@@ -4,6 +4,8 @@ import functools
 import math
 import numpy as np
 import wandb
+import pickle
+import itertools
 from datetime import datetime
 from ruamel.yaml import YAML
 from tqdm import trange, tqdm
@@ -30,23 +32,6 @@ from model_qq import TransformerQQ, TransformerBlock as TransformerBlockQQ
 from data_loader import TokenizedDataset
 
 
-def cosine_decay_schedule(step, total_steps, warmup_steps, lr_max, lr_min):
-    if step < warmup_steps:
-        return step / warmup_steps
-    else:
-        n = total_steps - warmup_steps - 1
-        step -= warmup_steps
-        coeff = 0.5 * (1 + math.cos(step / n * math.pi))
-        lr = lr_min + (lr_max - lr_min) * coeff
-        return lr / lr_max
-    
-def cycle(iterable):
-    # itertools.cycle does not shuffle the data after each iteration
-    while True:
-        for x in iterable:
-            yield x
-
-
 def func(global_rank, local_rank, world_size, train_cfg):
 
     torch.cuda.set_device(local_rank)
@@ -62,7 +47,7 @@ def func(global_rank, local_rank, world_size, train_cfg):
     ds_train = TokenizedDataset(filepaths=filepaths_train, context_length=4096)
 
     dl_train = DataLoader(ds_train, batch_size=train_cfg.batch_size, pin_memory=True, pin_memory_device=device)
-    dl_train = cycle(dl_train)
+    dl_train = itertools.cycle(dl_train)
 
     transformer_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
@@ -70,7 +55,7 @@ def func(global_rank, local_rank, world_size, train_cfg):
             TransformerBlock,
         }
     )
-    cpu_offload = CPUOffload(offload_params=False)
+    cpu_offload = CPUOffload(offload_params=True)
     mixed_precision = MixedPrecision(param_dtype=ptdtype)
 
     model = Transformer.load_meta_llama2("../llama/llama-2-7b")
@@ -86,13 +71,14 @@ def func(global_rank, local_rank, world_size, train_cfg):
     # model = torch.compile(model)
     model.train()
 
-    train_steps = 2000
-    train_iterator = trange(train_steps, leave=False, position=0, disable=(global_rank!=0))
+    inference_steps = 2000
+    inference_iterator = trange(inference_steps, leave=False, position=0, disable=(global_rank!=0))
 
+    buffer = {}
     activations = {}
     def get_activation(name):
         def hook(model, input, output):
-            activations[name] = output.detach()
+            activations[name] = output.detach().cpu()
         return hook
     
     model.embedding.register_forward_hook(get_activation('embedding'))
@@ -103,30 +89,38 @@ def func(global_rank, local_rank, world_size, train_cfg):
         block.attn_layer.attn_proj_v.register_forward_hook(get_activation(f'block_{i}_proj_v'))
         block.attn_layer.attn_proj_out.register_forward_hook(get_activation(f'block_{i}_proj_out'))
         block.ffn_norm.register_forward_hook(get_activation(f'block_{i}_ffn_norm'))
-        block.attn_layer.ffn_linear1.register_forward_hook(get_activation(f'block_{i}_ffn_linear1'))
-        block.attn_layer.ffn_linear2.register_forward_hook(get_activation(f'block_{i}_ffn_linear1'))
-        block.attn_layer.ffn_linear3.register_forward_hook(get_activation(f'block_{i}_ffn_linear1'))
+        block.ffn_layer.ffn_linear1.register_forward_hook(get_activation(f'block_{i}_ffn_linear1'))
+        block.ffn_layer.ffn_linear2.register_forward_hook(get_activation(f'block_{i}_ffn_linear1'))
+        block.ffn_layer.ffn_linear3.register_forward_hook(get_activation(f'block_{i}_ffn_linear1'))
     
     if not os.path.exists('activations'):
         os.makedirs('activations')
 
-    for step in train_iterator:
+    with torch.no_grad():
+        for step in inference_iterator:
 
-        x, _ = next(dl_train)
+            x, _ = next(dl_train)
 
-        with torch.no_grad():
             out = model(x)
 
-        for k in list(activations.keys()):
-            v = activations.pop(k)
-            inputs = torch.split(x, 1)
-            items = torch.split(v, 1)
-            outputs = torch.split(out['logits'], 1)
-            for i, (input, item, output) in enumerate(zip(inputs, items, outputs)):
+            for i in range(train_cfg.batch_size):
                 micro_step = step*train_cfg.batch_size+i
-                np.save(input.view(-1).numpy(), f'inputs_sample{micro_step}_{k}.npy')
-                np.save(item.view(-1).numpy(), f'activations_sample{micro_step}_{k}.npy')
-                np.save(output.view(-1).numpy(), f'outputs_sample{micro_step}_{k}.npy')
+                for k in list(activations.keys()):
+                    act = activations[k][i]
+                    d = {
+                        f'inputs_sample{micro_step}_{k}.npy': x[i].view(-1).cpu().to(torch.float32).numpy(),
+                        f'outputs_sample{micro_step}_{k}.npy': out['logits'][i].view(-1).cpu().to(torch.float32).numpy(),
+                        f'activations_sample{micro_step}_{k}.npy': act.view(-1).to(torch.float32).numpy()
+                    }
+                    buffer = {**buffer, **d}
+            activations = {}
+
+        if step % 10 == 0 and step != 0:
+            if global_rank==0:
+                with open(os.path.join('activations', f'llama2_values_{step//10}.npy'), 'wb') as f:
+                    pickle.dump(buffer, f)
+            buffer = {}
+            
 
 
 def distributed_worker(
@@ -197,7 +191,7 @@ def main():
             args.num_gpus,
             args.machine_rank,
             dist_url,
-            (train_cfg)
+            (train_cfg,)
         ),
         nprocs=args.num_gpus,
         daemon=False

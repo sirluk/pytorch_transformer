@@ -3,6 +3,7 @@
 *.hf
 *.pkl
 *.npy
+*.json
 tests/*
 data/*
 wandb/*

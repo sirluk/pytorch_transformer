@@ -42,7 +42,7 @@ def apply_rotary_emb(
     return out.type_as(x)
 
 
-class LegacyEmbedding(nn.Module):
+class AbsPosEmbedding(nn.Module):
 
     def __init__(self, vocab_size, context_length, model_dim, dropout_prob = 0.1):
         super().__init__()
@@ -88,9 +88,24 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
+    
+
+class Compressor(nn.Module):
+
+    def __init__(self, n_heads, model_dim):
+        super().__init__()
+        self.model_dim = model_dim
+        self.n_heads = n_heads
+        self.weight_proj = nn.Linear(model_dim, n_heads)
+
+    def forward(self, x, q):
+        conv_weight = self.weight_proj(x)
+        conv_weight = conv_weight.view(*x.shape[:2], 1, -1)
+        out = conv_weight @ q.transpose(1,2)
+        return out.transpose(1, 2)
 
 
-class CausalSelfAttention(nn.Module):
+class CausalSelfAttention2(nn.Module):
 
     def __init__(self, context_length, model_dim, n_heads, dropout_prob = 0.1, flash=True):
         super().__init__()
@@ -146,6 +161,105 @@ class CausalSelfAttention(nn.Module):
         
         attn_cat = attn_out.transpose(1,2).contiguous().view(B, C, D)
         return self.attn_dropout_out(self.attn_proj_out(attn_cat))
+    
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(
+            self,
+            context_length,
+            model_dim,
+            n_heads,
+            dropout_prob=0.1,
+            k_config = 'mha',
+            v_config = 'mha',
+            kv_groups = None,
+            flash=True
+        ):
+        super().__init__()
+
+        assert model_dim % n_heads == 0, 'model_dim needs to be a multiple of n_heads'
+
+        self.context_length = context_length
+        self.model_dim = model_dim
+        self.n_heads = n_heads
+        self.dropout_prob = dropout_prob
+        self.flash = flash
+        self.k_config = k_config
+        self.v_config = v_config
+        self.kv_groups = kv_groups
+
+        self.attn_proj_q = nn.Linear(self.model_dim, self.model_dim, bias=False)
+
+        self.attn_proj_k = self._get_proj(k_config)
+        self.attn_proj_v = self._get_proj(v_config)
+
+        self.attn_proj_out = nn.Linear(self.model_dim, self.model_dim, bias=False)
+        self.attn_dropout_out = nn.Dropout(dropout_prob)
+
+        if not self.flash:
+            causal_mask = torch.tril(torch.ones((context_length, context_length), dtype=bool)) \
+                .view(1, 1, context_length, context_length)
+            self.register_buffer('causal_mask', causal_mask)
+            self.attn_dropout_probs = nn.Dropout(dropout_prob)
+
+
+    def _get_proj(self, config):
+        if config == 'convx':
+            return Compressor(self.n_heads, self.model_dim)
+        elif config == 'conv':
+            return nn.Linear(self.n_heads, self.kv_groups, bias=False)
+        elif config == 'gqa':
+            return nn.Linear(self.model_dim, self.model_dim // self.n_heads * self.kv_groups, bias=False)
+        else:
+            return nn.Linear(self.model_dim, self.model_dim, bias=False)
+        
+
+    def _forward_kv(self, x, q, proj_layer, config):
+        if config == 'convx':
+            k_v = proj_layer(x, q)
+        elif config == 'conv':
+            k_v = proj_layer(q.transpose(1, -1)).transpose(1, -1)
+        elif config == 'gqa':
+            k_v = proj_layer(x)
+            k_v = k_v.reshape(*x.shape[:2], self.kv_groups, self.model_dim // self.n_heads).transpose(1, 2)
+        else:
+            k_v = proj_layer(x)
+            k_v = k_v.reshape(*x.shape[:2], self.n_heads, self.model_dim // self.n_heads).transpose(1, 2)
+
+        if 1 < k_v.shape[1] < self.n_heads:
+            # probably not very efficient
+            k_v = torch.repeat_interleave(k_v, k_v.shape[1], dim=1, output_size=self.n_heads)
+        
+        return k_v
+
+
+    def forward(self, x, freqs_cos, freqs_sin):
+        B, C, D = x.shape
+
+        q = self.attn_proj_q(x)
+        q = q.reshape(B, C, self.n_heads, self.model_dim // self.n_heads).transpose(1, 2)
+
+        k = self._forward_kv(x, q, self.attn_proj_k, self.k_config)
+        v = self._forward_kv(x, q, self.attn_proj_v, self.v_config)
+
+        # RoPE
+        q = apply_rotary_emb(q, freqs_cos, freqs_sin)
+        k = apply_rotary_emb(k, freqs_cos, freqs_sin)
+
+        if self.flash:
+            attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p = self.dropout_prob, is_causal = True)
+        else:
+            attn = q @ k.transpose(-1, -2)
+            attn_scaled = attn * (1.0 / math.sqrt(self.model_dim))
+            attn_masked = attn_scaled.masked_fill(~self.causal_mask[:, :, :C,:C], -math.inf)
+            attn_probs = F.softmax(attn_masked, dim=-1)
+            attn_drop = self.attn_dropout_probs(attn_probs)
+            attn_out = attn_drop @ v
+        
+        attn_cat = attn_out.transpose(1,2).contiguous().view(B, C, D)
+
+        return self.attn_dropout_out(self.attn_proj_out(attn_cat))
 
 
 class FFN(nn.Module):
@@ -179,6 +293,10 @@ class TransformerBlock(nn.Module):
         model_dim,
         n_attn_heads,
         ffn_hidden_dim,
+        ffn_hidden_dim_multiple_of,
+        k_config,
+        v_config,
+        kv_groups,
         dropout_prob = 0.1,
         bias = False,
         norm_eps = 1e-5,
@@ -190,15 +308,19 @@ class TransformerBlock(nn.Module):
         self.model_dim = model_dim
         self.n_attn_heads = n_attn_heads
         self.ffn_hidden_dim = ffn_hidden_dim
+        self.ffn_hidden_dim_multiple_of = ffn_hidden_dim_multiple_of
+        self.k_config = k_config
+        self.v_config = v_config
+        self.kv_groups = kv_groups
         self.dropout_prob = dropout_prob
         self.use_bias = bias
         self.norm_eps = norm_eps
         self.layer_id = layer_id
 
         self.attn_norm = RMSNorm(model_dim, eps=norm_eps)
-        self.attn_layer = CausalSelfAttention(context_length, model_dim, n_attn_heads, dropout_prob)
+        self.attn_layer = CausalSelfAttention(context_length, model_dim, n_attn_heads, dropout_prob, k_config, v_config, kv_groups)
         self.ffn_norm = RMSNorm(model_dim, eps=norm_eps)
-        self.ffn_layer = FFN(model_dim, ffn_hidden_dim, dropout_prob, bias)
+        self.ffn_layer = FFN(model_dim, ffn_hidden_dim, dropout_prob, bias, ffn_hidden_dim_multiple_of)
 
     def forward(self, x, freqs_cos, freqs_sin):
         x = x + self.attn_layer(self.attn_norm(x), freqs_cos, freqs_sin)
@@ -237,6 +359,14 @@ class Transformer(nn.Module):
         self.norm_eps = float(cfg.norm_eps)
         self.tie_word_embeddings = bool(cfg.tie_word_embeddings)
 
+        try:
+            self.k_config = str(cfg.k_config) if cfg.k_config is not None else 'mha'
+            self.v_config = str(cfg.v_config) if cfg.v_config is not None else 'mha'
+            self.kv_groups = int(cfg.kv_groups) if cfg.kv_groups is not None else None
+        except AttributeError:
+            self.k_config = 'mha'
+            self.v_config = 'mha'
+            self.kv_groups = None
 
         self.embedding = nn.Embedding(self.vocab_size, self.model_dim)
         self.embedding_dropout = nn.Dropout(self.dropout_prob)
@@ -248,6 +378,10 @@ class Transformer(nn.Module):
                 self.model_dim,
                 self.n_attn_heads,
                 self.ffn_hidden_dim,
+                self.ffn_hidden_dim_multiple_of,
+                self.k_config,
+                self.v_config,
+                self.kv_groups,
                 self.dropout_prob,
                 self.use_bias,
                 self.norm_eps,
@@ -274,7 +408,6 @@ class Transformer(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * self.n_blocks))
 
     def forward(self, x, y=None):
-        inference_mode = y is None
         _, seq_len = x.shape
         x = self.embedding(x)
         x = self.embedding_dropout(x)
@@ -287,7 +420,7 @@ class Transformer(nn.Module):
         
         x = self.output_norm(x)
 
-        if not inference_mode:
+        if y is not None:
             logits = self.output_proj(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
             return {'logits': logits, 'loss': loss}
@@ -617,7 +750,7 @@ def test_act():
 
 if __name__ == '__main__':
 
-    test_act()
+    # test_act()
 
     with open("cfg.yml", "r") as f:
         cfg = yaml.safe_load(f)
@@ -633,13 +766,13 @@ if __name__ == '__main__':
 
     model = Transformer(cfg)
 
-    import IPython; IPython.embed(); exit(1)
+    # import IPython; IPython.embed(); exit(1)
 
-    x = x[:, :x.shape[1]//2]
+    # x = x[:, :x.shape[1]//2]
 
-    logits = model(x)
+    logits, loss = model(x, y)
 
-    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+    # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
 
     import IPython; IPython.embed(); exit(1)
 

@@ -79,9 +79,11 @@ lr_lambda = partial(
 )
 lr_schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-train_str = "training - step {}, loss: {:7.5f}, last_eval_loss: {:7.5f}"
+train_str = "training - step {}, loss: {:7.5f}, last_eval_loss: {:7.5f}, memory: {}"
 train_steps = int(train_cfg.train_iters) // train_cfg.gradient_accumulation_steps
 train_iterator = trange(train_steps, leave=False, position=0)
+bytes_to_mb = lambda x: x / 1e6
+eval_loss = 999
 
 model.train()
 
@@ -111,7 +113,7 @@ for step in train_iterator:
     
     lr_schedule.step()
 
-    if step % train_cfg.eval_interval == 0:
+    if step+1 % train_cfg.eval_interval == 0:
 
         model.eval()
 
@@ -134,7 +136,10 @@ for step in train_iterator:
 
         model.train()
 
-    train_iterator.set_description(train_str.format(step, train_loss, eval_loss), refresh=True)
+    train_iterator.set_description(
+        train_str.format(step, train_loss, eval_loss, bytes_to_mb(torch.cuda.memory_allocated(device=DEVICE))),
+        refresh=True
+    )
 
 
 

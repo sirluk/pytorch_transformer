@@ -26,7 +26,6 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload, Backw
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from model import Transformer, TransformerBlock
-from model_qq import TransformerQQ, TransformerBlock as TransformerBlockQQ
 from data_loader import TokenizedDataset
 
 
@@ -51,14 +50,12 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg, model_cls, m
 
     if global_rank == 0:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if model_cfg.k_config == 'qq' or model_cfg.v_config == 'qq':
-            qq_config = f'{model_cfg.controller_alpha}_{model_cfg.controller_k}_{model_cfg.controller_temperature}_'
-        else:
-            qq_config = ''
+        k_kv_groups = f'{model_cfg.kv_groups}' if model_cfg.k_config == 'conv' or model_cfg.k_config == 'gqa' else ''
+        v_kv_groups = f'{model_cfg.kv_groups}' if model_cfg.v_config == 'conv' or model_cfg.v_config == 'gqa' else ''
         wandb.init(
-            project = "pytorch-transformer",
+            project = "transformer-experiments",
             config = train_cfg.__dict__,
-            name = f"{model_cfg.context_length}_{model_cfg.model_dim}_{model_cfg.n_blocks}_{model_cfg.n_attn_heads}_k{model_cfg.k_config}_v{model_cfg.v_config}_{qq_config}ts_{ts}"
+            name = f"{model_cfg.context_length}_{model_cfg.model_dim}_{model_cfg.n_blocks}_{model_cfg.n_attn_heads}_k{model_cfg.k_config}{k_kv_groups}_v{model_cfg.v_config}{v_kv_groups}_ts_{ts}"
         )
         checkpoint_dir = os.path.join('/local00/bioinf/hauzenbe/checkpoints', wandb.run.dir.split("/")[-2])
         if not os.path.exists(checkpoint_dir):
@@ -91,7 +88,7 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg, model_cls, m
             model_block_cls,
         }
     )
-    cpu_offload = CPUOffload(offload_params=True)
+    cpu_offload = CPUOffload(offload_params=False)
     mixed_precision = MixedPrecision(param_dtype=ptdtype)
 
     model = model_cls(model_cfg)
@@ -227,10 +224,11 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg, model_cls, m
         log_dict = {
             "train_loss": train_loss,
             "eval_loss": losses.mean(),
-            "eval_loss_aux": aux_losses.mean(),
             "memory_allocated": bytes_to_gb(torch.cuda.memory_allocated(device=device)),
             "memory_reserved": bytes_to_gb(torch.cuda.memory_reserved(device=device))
         }
+        if aux_losses.sum() != 0:
+            log_dict["aux_loss"] = aux_losses.mean()
         
         if global_rank == 0: wandb.log(log_dict)
 
@@ -303,8 +301,8 @@ def main():
     dist_url = f"tcp://{args.master_addr}:{args.master_port}"
     world_size = args.num_machines * args.num_gpus
 
-    model_cls = TransformerQQ if 'qq' in args.model_cfg else Transformer
-    model_block_cls = TransformerBlockQQ if 'qq' in args.model_cfg else TransformerBlock
+    model_cls = Transformer
+    model_block_cls = TransformerBlock
 
     mp.spawn(
         distributed_worker,

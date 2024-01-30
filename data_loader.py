@@ -55,7 +55,7 @@ class TokenizedDataset(IterableDataset):
                 ar_start_idx += len(shard_tokens)
     
 
-    def __init__(self, filepaths: Union[str, list[str]], context_length: int):
+    def __init__(self, filepaths: Union[str, list[str]], context_length: int, predict_n_tokens: int = 1):
         super().__init__()
             
         if isinstance(filepaths, str):
@@ -63,21 +63,22 @@ class TokenizedDataset(IterableDataset):
         self.filepaths = sorted(filepaths)
 
         self.context_length = context_length
+        self.predict_n_tokens = predict_n_tokens
 
 
     def _process_data(self, data, rng: Optional[random.Random] = None):
         if rng is None:
             rng = random.Random(0)
         ar = np.memmap(data, dtype=np.uint16, mode='r')
-        n_chunks, max_offset = divmod(len(ar)-1, self.context_length)
+        n_chunks, max_offset = divmod(len(ar)-self.predict_n_tokens, self.context_length)
         chunks = list(range(n_chunks))
         rng.shuffle(chunks)
         random_offset = rng.randint(0, max_offset)
         for chunk_id in chunks:
             start_idx = random_offset + self.context_length * chunk_id
             end_idx = start_idx + self.context_length
-            chunk = torch.tensor(ar[start_idx:end_idx+1].astype(np.int64))
-            yield chunk[:-1], chunk[1:]
+            chunk = torch.tensor(ar[start_idx:end_idx+self.predict_n_tokens].astype(np.int64))
+            yield chunk[:-self.predict_n_tokens], chunk[1:]
     
     
     def __iter__(self):

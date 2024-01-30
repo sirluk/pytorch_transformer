@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from model import apply_rotary_emb, RMSNorm, FFN
 
 
-class ControllerLayer(nn.Module):
+class ControllerLayer3(nn.Module):
 
     def __init__(self, input_dim, output_dim, alpha = 1e-2, k=1, temperature=1.0):
         super().__init__()
@@ -38,13 +38,14 @@ class ControllerLayer(nn.Module):
 
         n = 4
         groups = torch.argsort(head_likelihood, dim=-1, descending=True)
-        mean_group_probs = torch.gather(probs, dim=-1, index=groups.unsqueeze(1).expand(-1, nh, -1, -1)).reshape(B, nh, C, -1, n).mean(dim=(1,3))
+        probs_sorted = torch.gather(probs, dim=-1, index=groups.unsqueeze(1).expand(-1, nh, -1, -1))
+        #mean_group_probs = probs_sorted.view(B, nh, C, -1, n).mean(dim=3)
         router_selections = torch.gather(
-            x.unsqueeze(-2).expand(-1,-1,-1,nh,-1),
+            x.view(B, nh, C, 1, 1, D).expand(-1,-1,-1, nh//n, n, -1),
             dim=1,
-            index=groups.unsqueeze(1).unsqueeze(-1).expand(-1, nh, -1, -1, self.input_dim)
+            index=groups.view(B, 1, C, -1, n, 1).expand(-1, nh, -1, -1, -1, self.input_dim)
         )
-
+        #router_selections = all_selections_sorted.view(B, nh, C, -1, n, D).mean(dim=3)
         import IPython; IPython.embed(); exit(1)
 
         groups.reshape(B, C, -1, n).reshape(-2,-1)
@@ -133,6 +134,57 @@ class ControllerLayer2(nn.Module):
         router_probs = self._gather_router_probs(probs)
         router_fraction = self._gather_router_fraction(topk_idx)
         return self.alpha * self.output_dim * (router_probs * router_fraction).sum()
+    
+
+class ControllerLayer(nn.Module):
+
+    def __init__(self, input_dim, output_dim, alpha = 1e-2, k=1, temperature=1.0):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.alpha = alpha
+        self.k = k
+        self.temperature = temperature
+        self.use_temperature = temperature != 1.0
+
+        self.proj = nn.Linear(input_dim, output_dim, bias=False)
+
+    def forward(self, x, return_loss=True, return_moe_metrics=False):
+
+        logits = self.proj(x)
+        if self.use_temperature:
+            logits = logits / self.temperature
+        probs = F.softmax(logits, dim=-1)
+        topk_probs, topk_idx = torch.topk(probs, k=self.k, dim=-1)
+        static_dims = (len(x.shape)) * [-1]
+        router_selections = torch.gather(
+            x.unsqueeze(-2).expand(*x.shape[:-1], self.k, self.input_dim),
+            dim=1,
+            index=topk_idx.unsqueeze(-1).expand(*static_dims, self.input_dim)
+        )
+        return_dict = {} 
+        return_dict['y'] = (topk_probs.unsqueeze(-1) * router_selections).sum(dim=-2)
+        if return_loss:
+            return_dict['aux_loss'] = self._get_auxiliary_loss(probs, topk_idx)
+        if return_moe_metrics:
+            return_dict['topk_probs'] = topk_probs
+            return_dict['topk_idx'] = topk_idx
+        return return_dict
+    
+    def _gather_router_probs(self, probs):
+        batch_dims = torch.tensor(probs.shape[:-1])
+        router_probs = probs.sum(dim=list(range(len(batch_dims)))) / batch_dims.prod()
+        return router_probs
+
+    def _gather_router_fraction(self, topk_idx):
+        counts = torch.bincount(topk_idx.view(-1), minlength=self.output_dim)
+        return counts / counts.sum()
+    
+    def _get_auxiliary_loss(self, probs, topk_idx):
+        router_probs = self._gather_router_probs(probs)
+        router_fraction = self._gather_router_fraction(topk_idx)
+        return self.alpha * self.output_dim * (router_probs * router_fraction).sum()
         
 
 class CausalSelfAttention(nn.Module):
@@ -144,8 +196,8 @@ class CausalSelfAttention(nn.Module):
             n_heads,
             dropout_prob=0.1,
             flash=True,
-            k_config = 'qq',
-            v_config = 'qq',
+            k_config = 'mha',
+            v_config = 'mha',
             gqa_groups = None,
             **controller_kwargs
         ):
@@ -178,8 +230,8 @@ class CausalSelfAttention(nn.Module):
 
 
     def _get_proj(self, config, **kwargs):
-        if config == 'qq':
-            return ControllerLayer(self.model_dim // self.n_heads, self.n_heads, **kwargs)
+        if config == 'conv':
+            return nn.Linear(self.n_heads, 1, bias=False)
         elif config == 'mqa':
             return nn.Linear(self.model_dim, self.model_dim // self.n_heads, bias=False)
         elif config == 'gqa':
@@ -189,8 +241,9 @@ class CausalSelfAttention(nn.Module):
         
 
     def _forward_kv(self, x, proj_layer, config):
-        if config == 'qq':
-            return proj_layer(x)
+        if config == 'conv':
+            k_v = proj_layer(x.transpose(1, -1)).transpose(1, -1)
+            return {'y': k_v}
         elif config == 'mha':
             k_v = proj_layer(x)
             k_v = k_v.reshape(*x.shape[:2], self.n_heads, self.model_dim // self.n_heads).transpose(1, 2)
@@ -211,10 +264,11 @@ class CausalSelfAttention(nn.Module):
         q = self.attn_proj_q(x)
         q = q.reshape(B, C, self.n_heads, self.model_dim // self.n_heads).transpose(1, 2)
 
+        controller_kwargs = {k:v for k,v in controller_kwargs.items() if v}
         proj_k = functools.partial(self.attn_proj_k, **controller_kwargs)
         proj_v = functools.partial(self.attn_proj_v, **controller_kwargs)
-        k_return_dict = self._forward_kv(q if self.k_config == 'qq' else x, proj_k, self.k_config)
-        v_return_dict = self._forward_kv(x if self.v_config != 'qq' else q, proj_v, self.v_config)
+        k_return_dict = self._forward_kv(q if self.k_config == 'conv' else x, proj_k, self.k_config)
+        v_return_dict = self._forward_kv(q if self.v_config == 'conv' else x, proj_v, self.v_config)
         k = k_return_dict.pop('y')
         v = v_return_dict.pop('y')
 
@@ -223,7 +277,7 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, freqs_cos, freqs_sin)
 
         if self.flash:
-            attn_out = F.scaled_dot_product_attention(q, k, v_return_dict, dropout_p = self.dropout_prob, is_causal = True)
+            attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p = self.dropout_prob, is_causal = True)
         else:
             attn = q @ k.transpose(-1, -2)
             attn_scaled = attn * (1.0 / math.sqrt(self.model_dim))
@@ -278,10 +332,6 @@ class TransformerBlock(nn.Module):
     
 
 class TransformerQQ(nn.Module):
-
-    @functools.cached_property
-    def qq_active(self):
-        return self.k_config == 'qq' or self.v_config == 'qq'
 
     def precompute_freqs_rope(self):
         theta = 10000.0
@@ -360,7 +410,6 @@ class TransformerQQ(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * self.n_blocks))
 
     def forward(self, x, y=None, return_aux_loss=False, return_moe_metrics=False):
-        inference_mode = y is None
         _, seq_len = x.shape
         x = self.embedding(x)
         x = self.embedding_dropout(x)
@@ -370,7 +419,7 @@ class TransformerQQ(nn.Module):
 
         return_dict = {}
         for i, block in enumerate(self.blocks):
-            block_return_dict = block(x, freqs_cos, freqs_sin, return_aux_loss=True, return_moe_metrics=False)
+            block_return_dict = block(x, freqs_cos, freqs_sin, return_aux_loss=return_aux_loss, return_moe_metrics=return_moe_metrics)
             if return_aux_loss:
                 try:
                     return_dict['aux_loss'] += block_return_dict.pop('aux_loss', 0)
@@ -383,7 +432,7 @@ class TransformerQQ(nn.Module):
         
         x = self.output_norm(x)
 
-        if inference_mode:
+        if y is None:
             return {'logits': self.output_proj(x[:, [-1], :])}
         else:
             logits = self.output_proj(x)
@@ -486,15 +535,17 @@ if __name__ == '__main__':
     freqs_cos = freqs_cos.view(1, 1, *freqs_cos.shape)
     freqs_sin = freqs_sin.view(1, 1, *freqs_sin.shape)
 
-    x = torch.randn((4, cfg.context_length, cfg.model_dim))
+    # x = torch.randn((4, cfg.context_length, cfg.model_dim))
 
     # import IPython; IPython.embed(); exit(1)
 
-    y = qq(x, freqs_cos, freqs_sin)
+    # y = qq(x, freqs_cos, freqs_sin)
 
     # y.sum().backward()
 
     model = TransformerQQ(cfg)
+
+    model(x)
 
     model.generate(x, 10, temperature=0.5, top_k=5)
 

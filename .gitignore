@@ -1,8 +1,11 @@
 # custom
 *.bin
 *.hf
+*.pkl
+*.npy
 tests/*
 data/*
+wandb/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

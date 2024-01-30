@@ -3,6 +3,9 @@ model_cfg_small:
   model_dim: 512
   n_blocks: 6
   n_attn_heads: 8
+  k_config: 'mha'
+  v_config: 'mha'
+  kv_groups: null
   ffn_hidden_dim: null
   dropout_prob: 0.0
   bias: False
@@ -14,6 +17,9 @@ model_cfg:
   model_dim: 1024
   n_blocks: 16
   n_attn_heads: 16
+  k_config: 'convx'
+  v_config: 'gqa'
+  kv_groups: 4
   ffn_hidden_dim: null
   dropout_prob: 0.0
   bias: False
@@ -25,6 +31,9 @@ model_cfg_llama7b:
   model_dim: 4096
   n_blocks: 32
   n_attn_heads: 32
+  k_config: 'mha'
+  v_config: 'mha'
+  kv_groups: null
   ffn_hidden_dim: null # model_dim * 4
   dropout_prob: 0.0
   bias: False
@@ -34,7 +43,7 @@ model_cfg_llama7b:
 train_cfg:
   lr: 3e-4
   lr_min: 3e-5
-  batch_size: 16
+  batch_size: 8
   adam_b1: 0.9
   adam_b2: 0.95
   adam_eps: 10e-6
@@ -57,8 +66,8 @@ qq_model_cfg:
   norm_eps: 1e-5
   tie_word_embeddings: True
   ffn_hidden_dim_multiple_of: 256
-  k_config: 'qq'
-  v_config: 'qq'
+  k_config: 'conv'
+  v_config: 'conv'
   gqa_groups: 4
   controller_alpha: 1e-2
   controller_k: 1

@@ -25,7 +25,7 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload, BackwardPrefetch
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-from model import Transformer, TransformerBlock
+from model import TransformerBlock, Transformer, TransformerContext
 from data_loader import TokenizedDataset
 
 
@@ -50,12 +50,13 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg, model_cls, m
 
     if global_rank == 0:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        k_kv_groups = f'{model_cfg.kv_groups}' if model_cfg.k_config == 'conv' or model_cfg.k_config == 'gqa' else ''
-        v_kv_groups = f'{model_cfg.kv_groups}' if model_cfg.v_config == 'conv' or model_cfg.v_config == 'gqa' else ''
+        k_kv_groups = f'{model_cfg.kv_groups}' if model_cfg.k_config != 'mha' else ''
+        v_kv_groups = f'{model_cfg.kv_groups}' if model_cfg.v_config != 'mha' else ''
+        context = 'context_' if train_cfg.future_context_size > 1 else ''
         wandb.init(
             project = "transformer-experiments",
             config = train_cfg.__dict__,
-            name = f"{model_cfg.context_length}_{model_cfg.model_dim}_{model_cfg.n_blocks}_{model_cfg.n_attn_heads}_k{model_cfg.k_config}{k_kv_groups}_v{model_cfg.v_config}{v_kv_groups}_ts_{ts}"
+            name = f"{context}{model_cfg.context_length}_{model_cfg.model_dim}_{model_cfg.n_blocks}_{model_cfg.n_attn_heads}_k{model_cfg.k_config}{k_kv_groups}_v{model_cfg.v_config}{v_kv_groups}_ts_{ts}"
         )
         checkpoint_dir = os.path.join('/local00/bioinf/hauzenbe/checkpoints', wandb.run.dir.split("/")[-2])
         if not os.path.exists(checkpoint_dir):
@@ -75,8 +76,8 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg, model_cls, m
     path = '/local00/bioinf/hauzenbe/slimpajama_sampled'
     filepaths_train = [os.path.join(path, 'train', f) for f in os.listdir(os.path.join(path, 'train'))]
     filepaths_val = [os.path.join(path, 'validation', f) for f in os.listdir(os.path.join(path, 'validation'))]
-    ds_train = TokenizedDataset(filepaths=filepaths_train, context_length=model_cfg.context_length)
-    ds_val = TokenizedDataset(filepaths=filepaths_val, context_length=model_cfg.context_length)
+    ds_train = TokenizedDataset(filepaths=filepaths_train, context_length=model_cfg.context_length, predict_n_tokens=train_cfg.future_context_size)
+    ds_val = TokenizedDataset(filepaths=filepaths_val, context_length=model_cfg.context_length, predict_n_tokens=train_cfg.future_context_size)
 
     dl_train = DataLoader(ds_train, batch_size=train_cfg.batch_size, pin_memory=True, pin_memory_device=device)
     dl_val = DataLoader(ds_val, batch_size=train_cfg.batch_size, pin_memory=True, pin_memory_device=device)
@@ -89,7 +90,7 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg, model_cls, m
         }
     )
     cpu_offload = CPUOffload(offload_params=False)
-    mixed_precision = MixedPrecision(param_dtype=ptdtype)
+    mixed_precision = MixedPrecision(param_dtype=ptdtype, buffer_dtype=ptdtype)
 
     model = model_cls(model_cfg)
     model.to(device)
@@ -139,8 +140,8 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg, model_cls, m
             for _ in range(train_cfg.gradient_accumulation_steps):
                 out = model(x, y)
                 partial_loss = out['loss']
-                if 'aux_loss' in out:
-                    partial_loss += out['aux_loss']
+                if 'context_loss' in out:
+                    partial_loss += 0.1 * out['context_loss']
                 loss += partial_loss / train_cfg.gradient_accumulation_steps
         scaler.scale(loss).backward()
 
@@ -170,7 +171,7 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg, model_cls, m
             eval_iterator = tqdm(dl_val, desc=eval_str.format(0), total=eval_iters, leave=False, position=1, disable=(global_rank!=0))
 
             losses = torch.zeros((eval_iters,), device=device)
-            aux_losses = torch.zeros((eval_iters,), device=device)
+            context_losses = torch.zeros((eval_iters,), device=device)
 
             with torch.no_grad():
                 for eval_step, (x, y) in enumerate(eval_iterator):
@@ -186,20 +187,20 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg, model_cls, m
                     out = model(x, y)
 
                     losses[eval_step] = out['loss']
-                    if 'aux_loss' in out:
-                        aux_losses[eval_step] = out['aux_loss']
+                    if 'context_loss' in out:
+                        context_losses[eval_step] = out['context_loss']
 
                     if eval_step + 1 == eval_iters:
                         break
 
             if world_size > 1:
                 dist.all_reduce(losses, op=dist.ReduceOp.SUM)
-                if 'aux_loss' in out:
-                    dist.all_reduce(aux_losses, op=dist.ReduceOp.SUM)
+                if 'context_loss' in out:
+                    dist.all_reduce(context_losses, op=dist.ReduceOp.SUM)
 
             losses = losses / world_size
-            aux_losses = aux_losses / world_size
-            eval_loss = (losses + aux_losses).mean()
+            context_losses = context_losses / world_size
+            eval_loss = (losses + context_losses).mean()
 
             model.train()
 
@@ -227,8 +228,8 @@ def func(global_rank, local_rank, world_size, train_cfg, model_cfg, model_cls, m
             "memory_allocated": bytes_to_gb(torch.cuda.memory_allocated(device=device)),
             "memory_reserved": bytes_to_gb(torch.cuda.memory_reserved(device=device))
         }
-        if aux_losses.sum() != 0:
-            log_dict["aux_loss"] = aux_losses.mean()
+        if 'context_loss' in out:
+            log_dict["context_loss"] = context_losses.mean()
         
         if global_rank == 0: wandb.log(log_dict)
 

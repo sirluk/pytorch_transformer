@@ -33,6 +33,9 @@ from model_qq import TransformerQQ, TransformerBlock as TransformerBlockQQ
 from data_loader import TokenizedDataset
 
 
+PATH_NAME = 'activations'
+
+
 def func(global_rank, local_rank, world_size, train_cfg):
 
     torch.cuda.set_device(local_rank)
@@ -99,8 +102,8 @@ def func(global_rank, local_rank, world_size, train_cfg):
         # block.ffn_layer.ffn_linear3.register_forward_hook(get_activation(f'block{i}_ffn_linear3'))
         block.ffn_layer.register_forward_hook(get_activation(f'block{i}_ffn'))
     
-    if not os.path.exists('activations'):
-        os.makedirs('activations')
+    if not os.path.exists(PATH_NAME):
+        os.makedirs(PATH_NAME)
 
     inference_steps = 32
     inference_iterator = trange(inference_steps, leave=False, position=0, disable=(global_rank!=0))
@@ -119,20 +122,20 @@ def func(global_rank, local_rank, world_size, train_cfg):
                     inputs_i8, ndi = quantize(x[i].view(-1).cpu())
                     outputs_i8, ndo = quantize(out['logits'][i].view(-1).cpu())
                     
-                    np.save(os.path.join('activations', f'inputs_sample{micro_step}.npy'), inputs_i8)
-                    np.save(os.path.join('activations', f'outputs_sample{micro_step}.npy'), outputs_i8)
+                    np.save(os.path.join(PATH_NAME, f'inputs_sample{micro_step}.npy'), inputs_i8)
+                    np.save(os.path.join(PATH_NAME, f'outputs_sample{micro_step}.npy'), outputs_i8)
                     quantization_scalars[f'inputs_sample{micro_step}.npy'] = ndi
                     quantization_scalars[f'outputs_sample{micro_step}.npy'] = ndo
                 for k in list(activations.keys()):
                     act = activations[k][i]
                     if global_rank==0:
                         activations_i8, nda = quantize(act.view(-1))
-                        np.save(os.path.join('activations', f'activations_sample{micro_step}_{k}.npy'), activations_i8.numpy())
+                        np.save(os.path.join(PATH_NAME, f'activations_sample{micro_step}_{k}.npy'), activations_i8.numpy())
                         quantization_scalars[f'activations_sample{micro_step}_{k}.npy'] = nda
             activations = {}
 
         if global_rank == 0:
-            with open(os.path.join('activations', 'quantization_scalars.json'), 'w') as fp:
+            with open(os.path.join(PATH_NAME, 'quantization_scalars.json'), 'w') as fp:
                 json.dump(quantization_scalars, fp)
             
 

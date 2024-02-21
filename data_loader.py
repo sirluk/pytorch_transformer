@@ -8,6 +8,7 @@ import math
 import random
 import numpy as np
 import torch.distributed as dist
+from pathlib import Path
 from tokenizer import Tokenizer
 from itertools import chain, cycle
 from functools import partial
@@ -57,10 +58,19 @@ class TokenizedDataset(IterableDataset):
 
     def __init__(self, filepaths: Union[str, list[str]], context_length: int, predict_n_tokens: int = 1):
         super().__init__()
-            
+        
         if isinstance(filepaths, str):
             filepaths = [filepaths]
-        self.filepaths = sorted(filepaths)
+        
+        all_filepaths = []
+        for p in filepaths:
+            p = Path(p)
+            if p.is_dir():
+                all_filepaths.extend(list(p.rglob('*.bin')))
+            else:
+                all_filepaths.append(p)
+
+        self.filepaths = sorted(all_filepaths)
 
         self.context_length = context_length
         self.predict_n_tokens = predict_n_tokens

@@ -50,12 +50,14 @@ class Transformer(nn.Module):
         self.dropout_prob = float(cfg.dropout_prob)
         self.use_bias = bool(cfg.bias)
         self.norm_eps = float(cfg.norm_eps)
+        
         # new params
-        self.future_context_size = 8
-        # self.register_parameter('context_conv_scale', nn.Parameter(torch.Tensor(1)))
-        self.register_parameter('context_conv_weight', nn.Parameter(torch.Tensor(1)))
+        self.future_context_size = 16
+        self.topk_logits = None
         self.context_conv_scale = 1
-        # self.context_conv_weight = 0.5
+        self.context_conv_strength = 0.5
+        exp_decay = self.context_conv_scale * torch.exp(-self.context_conv_strength * torch.arange(self.future_context_size).flip(0))
+        self.register_buffer('exp_decay', exp_decay / exp_decay.sum(), persistent=False)
 
         self.embedding = nn.Embedding(self.vocab_size, self.model_dim)
         self.embedding_dropout = nn.Dropout(self.dropout_prob)
@@ -116,38 +118,45 @@ class Transformer(nn.Module):
             # convolution along time dimension
             # TODO conv weight as output of linear projection of last token?
             # TODO detach c or not?
-            context_conv_kernel = self.context_conv_scale * torch.exp(-self.context_conv_weight * torch.arange(self.future_context_size))
             context = F.conv1d(
-                F.pad(c[:,:-1].transpose(1,-1), (self.future_context_size,0), value=0).view(B*self.vocab_size, 1, -1),
-                context_conv_kernel.view(1,1,-1)
-            ).view(B, self.vocab_size, seq_len).transpose(1,-1)
+                F.pad(c.transpose(1,2), (self.future_context_size-1,0), value=0).view(B*self.vocab_size, 1, -1),
+                self.exp_decay.view(1,1,-1)
+            ).view(B, self.vocab_size, seq_len).transpose(1,2)
 
             # build indices for context target
-            indices = torch.arange(seq_len, device=x.device)
-            indices = (indices.view(-1, 1).repeat((1, seq_len)) - indices.view(1, -1))
-            indices = (indices[:, :self.future_context_size] % seq_len).flip(1)
+            indices = torch.arange(y.shape[1], device=x.device)
+            indices = (indices.view(-1, 1).repeat((1, y.shape[1])) - indices.view(1, -1))
+            indices = (indices[self.future_context_size-1:, :self.future_context_size] % y.shape[1]).flip(1)
 
             # get context targets
-            y_context = torch.gather(y[:, self.future_context_size-1:], dim=1, index=indices.view(1, -1).expand(x.shape[0], -1)).view(B, seq_len, -1)
+            y_context = torch.gather(y, dim=1, index=indices.view(1, -1).expand(x.shape[0], -1)).view(B, seq_len, -1)
             y_context = F.one_hot(y_context, num_classes=self.vocab_size).sum(-2)
+
+            # context loss
             context_loss_alpha = 0.5
-            context_loss_weights = 1 + context_loss_alpha * (y_context > 1).any(dim=0)
+            context_loss_weights = 1. + context_loss_alpha * (y_context > 1).any(dim=0)
             context_loss = F.binary_cross_entropy_with_logits(c, y_context.bool().float(), weight = context_loss_weights)
 
-            import IPython; IPython.embed(); exit(1)
-            logits += context
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y[:,:-self.future_context_size+1:].view(-1), ignore_index=-1)
-            # import IPython ;IPython.embed(); exit(1)
+            if self.topk_logits is not None:
+                idx = torch.argsort(logits, dim=-1, descending=True)[...,self.topk_logits:]
+                context = context.scatter(dim=-1, index=idx, value=-math.inf)
+            # not sure rescaling both logits is needed
+            logits = logits + context
+            
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y[:,:-self.future_context_size+1:].contiguous().view(-1), ignore_index=-1)
+        
             return {'logits': logits, 'loss': loss, 'context_loss': context_loss}
         else:
             logits = self.output_proj(x[:, [-1]])
-            c = self.context_proj(x[:, -self.future_context_size-1:-1])
-            context_conv_kernel = self.context_conv_scale * torch.exp(-self.context_conv_weight * torch.arange(self.future_context_size))
-            context = F.conv1d(
-                F.pad(c.transpose(1,-1), (self.future_context_size-c.shape[1],0), value=0).contiguous().view(B*self.vocab_size, 1, -1),
-                context_conv_kernel.view(1,1,-1)
-            ).view(B, self.vocab_size, -1).transpose(1,-1)
-            logits += context
+            c = self.context_proj(x[:, -self.future_context_size:])
+            
+            context = (c.transpose(1,2) * self.exp_decay[-c.shape[1]:]).sum(-1).unsqueeze(1)
+
+            if self.topk_logits is not None:
+                idx = torch.argsort(logits, dim=-1, descending=True)[...,self.topk_logits:]
+                context = context.scatter(dim=-1, index=idx, value=0.)
+            logits = logits + context
+
             return {'logits': logits}
         
     def _init_weights(self, module):
@@ -206,13 +215,14 @@ if __name__ == '__main__':
 
     setattr(cfg, 'vocab_size', TokenizedDataset.TOKENIZER.n_words)
 
-    ds = TokenizedDataset(filepaths='data/train.bin', context_length=cfg.context_length, predict_n_tokens=8)
+    ds = TokenizedDataset(filepaths='data/train.bin', context_length=cfg.context_length, predict_n_tokens=16)
 
     dl = DataLoader(ds, batch_size=4)
 
     x, y = next(iter(dl))
 
     model = Transformer(cfg)
+
 
     # import IPython; IPython.embed(); exit(1)
 
